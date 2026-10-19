@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Občanský průkaz – anonymizace</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f5f5f5;
+      margin: 0;
+      padding: 20px;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      background: white;
+      padding: 24px;
+      border-radius: 16px;
+      box-shadow: 0 10px 20px rgba(0,0,0,.05);
+    }
+    h1 {
+      margin-top: 0;
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin: 20px 0;
+    }
+    input[type="file"] {
+      padding: 8px;
+    }
+    button {
+      background: #2563eb;
+      color: white;
+      border: none;
+      border-radius: 10px;
+      padding: 10px 16px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+    .panel {
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      padding: 12px;
+      background: #fafafa;
+    }
+    canvas {
+      width: 100%;
+      max-height: 70vh;
+      border-radius: 8px;
+      background: #eee;
+    }
+    .small {
+      font-size: 12px;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Občanský průkaz – anonymizace</h1>
+
+    <div class="controls">
+      <input type="file" id="fileInput" accept=".png,.jpg,.jpeg" />
+      <button id="processBtn">Anonymizovat</button>
+    </div>
+
+    <div class="small">
+      Funkce: pomocí šablony zakryje citlivé oblasti na přední straně občanského průkazu.
+    </div>
+
+    <div class="grid">
+      <div class="panel">
+        <h3>Původní obrázek</h3>
+        <canvas id="srcCanvas"></canvas>
+      </div>
+
+      <div class="panel">
+        <h3>Anonymizovaný výstup</h3>
+        <canvas id="outCanvas"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+  <script>
+    let cvReady = false;
+
+    function onOpenCvReady() {
+      cvReady = true;
+      console.log("OpenCV ready");
+    }
+
+    const fileInput = document.getElementById("fileInput");
+    const processBtn = document.getElementById("processBtn");
+    const srcCanvas = document.getElementById("srcCanvas");
+    const outCanvas = document.getElementById("outCanvas");
+
+    fileInput.addEventListener("change", function (event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = function (e) {
+        const img = new Image();
+        img.onload = function () {
+          const ctx = srcCanvas.getContext("2d");
+          srcCanvas.width = img.width;
+          srcCanvas.height = img.height;
+          ctx.clearRect(0, 0, srcCanvas.width, srcCanvas.height);
+          ctx.drawImage(img, 0, 0);
+
+          const outCtx = outCanvas.getContext("2d");
+          outCanvas.width = img.width;
+          outCanvas.height = img.height;
+          outCtx.clearRect(0, 0, outCanvas.width, outCanvas.height);
+          outCtx.drawImage(img, 0, 0);
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    function orderPoints(pts) {
+      const rect = [];
+      const s = pts.map(p => p.x + p.y);
+      const diff = pts.map(p => p.x - p.y);
+
+      rect[0] = pts[s.indexOf(Math.min(...s))];
+      rect[2] = pts[s.indexOf(Math.max(...s))];
+      rect[1] = pts[diff.indexOf(Math.min(...diff))];
+      rect[3] = pts[diff.indexOf(Math.max(...diff))];
+
+      return rect;
+    }
+
+    function detectDocumentContour(src) {
+      const gray = new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+      const blur = new cv.Mat();
+      cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+
+      const edges = new cv.Mat();
+      cv.Canny(blur, edges, 50, 150);
+
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+
+      cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+      let bestContour = null;
+      let bestArea = 0;
+
+      for (let i = 0; i < contours.size(); ++i) {
+        const c = contours.get(i);
+        const peri = cv.arcLength(c, true);
+        const approx = new cv.Mat();
+        cv.approxPolyDP(c, approx, 0.02 * peri, true);
+
+        if (approx.rows === 4) {
+          const area = cv.contourArea(approx);
+          if (area > bestArea) {
+            bestArea = area;
+            bestContour = approx;
+          }
+        }
+      }
+
+      if (!bestContour) {
+        return null;
+      }
+
+      const pts = [];
+      for (let i = 0; i < bestContour.rows; ++i) {
+        pts.push({
+          x: bestContour.data32S[i * 2],
+          y: bestContour.data32S[i * 2 + 1]
+        });
+      }
+      return pts;
+    }
+
+    function applyPerspectiveWarp(src, pts) {
+      const ordered = orderPoints(pts);
+      const width = 860;
+      const height = 540;
+
+      const dst = [
+        { x: 0, y: 0 },
+        { x: width - 1, y: 0 },
+        { x: width - 1, y: height - 1 },
+        { x: 0, y: height - 1 }
+      ];
+
+      const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, ordered.flatMap(p => [p.x, p.y]));
+      const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, dst.flatMap(p => [p.x, p.y]));
+
+      const transform = cv.getPerspectiveTransform(srcPts, dstPts);
+      const warped = new cv.Mat();
+      cv.warpPerspective(src, warped, transform, new cv.Size(width, height));
+
+      srcPts.delete();
+      dstPts.delete();
+      transform.delete();
+
+      return warped;
+    }
+
+    function drawMaskOnWarped(warped) {
+      const maskCanvas = document.createElement("canvas");
+      maskCanvas.width = warped.cols;
+      maskCanvas.height = warped.rows;
+      const mctx = maskCanvas.getContext("2d");
+
+      // Šablona pro českou občanku
+      // x1, y1, x2, y2 v relativních hodnotách 0..1
+      const template = [
+        { x: 0.65, y: 0.05, w: 0.31, h: 0.47 }, // foto
+        { x: 0.62, y: 0.02, w: 0.34, h: 0.10 }, // číslo dokladu
+        { x: 0.35, y: 0.26, w: 0.25, h: 0.09 }, // místo narození
+        { x: 0.52, y: 0.19, w: 0.10, h: 0.06 }, // pohlaví
+        { x: 0.60, y: 0.68, w: 0.36, h: 0.18 }, // podpis
+        { x: 0.04, y: 0.42, w: 0.44, h: 0.18 }  // další citlivá oblast
+      ];
+
+      mctx.fillStyle = "black";
+      template.forEach(box => {
+        const x = box.x * warped.cols;
+        const y = box.y * warped.rows;
+        const w = box.w * warped.cols;
+        const h = box.h * warped.rows;
+        mctx.fillRect(x, y, w, h);
+      });
+
+      const mask = cv.imread(maskCanvas);
+      return mask;
+    }
+
+    processBtn.addEventListener("click", function () {
+      if (!cvReady) {
+        alert("OpenCV se ještě nenačetl.");
+        return;
+      }
+
+      const image = new Image();
+      const file = fileInput.files[0];
+      if (!file) {
+        alert("Nahraj obrázek.");
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = function (e) {
+        image.onload = function () {
+          const src = cv.imread(image);
+
+          const contour = detectDocumentContour(src);
+          if (!contour) {
+            alert("Něco se nepovedlo: nebyl nalezen dokument.");
+            return;
+          }
+
+          const warped = applyPerspectiveWarp(src, contour);
+
+          // vytvoření masky podle šablony
+          const mask = drawMaskOnWarped(warped);
+          const warpedWithMask = new cv.Mat();
+          cv.copyTo(warped, mask, warpedWithMask);
+
+          // vykreslení do output canvas
+          const outCanvasCtx = outCanvas.getContext("2d");
+          outCanvas.width = warped.cols;
+          outCanvas.height = warped.rows;
+          cv.imshow(outCanvas.id, warpedWithMask);
+
+          src.delete();
+          warped.delete();
+          mask.delete();
+          warpedWithMask.delete();
+        };
+        image.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  </script>
+</body>
+</html>
